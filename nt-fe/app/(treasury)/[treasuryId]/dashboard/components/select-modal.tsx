@@ -28,8 +28,6 @@ interface SelectModalPropsBase {
     options: SelectOption[];
     searchPlaceholder?: string;
     isLoading?: boolean;
-    fixNear?: boolean;
-    roundIcons?: boolean;
     renderIcon?: (item: SelectOption) => ReactNode;
     renderContent?: (item: SelectOption) => ReactNode;
     renderRight?: (item: SelectOption) => ReactNode;
@@ -66,8 +64,6 @@ export function SelectModal({
     selectedId,
     selectedIds,
     multiSelect,
-    fixNear,
-    roundIcons,
     renderIcon,
     renderContent,
     renderRight,
@@ -160,8 +156,6 @@ export function SelectModal({
                         icon={item.icon}
                         gradient={item.gradient}
                         alt={item.symbol || item.name}
-                        roundIcons={roundIcons}
-                        fixNear={fixNear}
                     />
                 )}
                 {renderContent ? (
@@ -182,12 +176,10 @@ export function SelectModal({
             </Button>
         ),
         [
-            fixNear,
             handleSelect,
             renderContent,
             renderIcon,
             resolvedRenderRight,
-            roundIcons,
             selectedId,
         ],
     );
