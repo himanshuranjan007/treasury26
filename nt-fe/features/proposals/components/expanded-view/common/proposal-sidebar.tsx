@@ -554,7 +554,8 @@ export function ProposalSidebar({
                                 className="flex gap-1 w-full"
                                 onClick={() =>
                                     onDeposit(
-                                        insufficientBalanceInfo.tokenSymbol,
+                                        insufficientBalanceInfo.tokenId ||
+                                            insufficientBalanceInfo.tokenSymbol,
                                         insufficientBalanceInfo.tokenNetwork,
                                     )
                                 }

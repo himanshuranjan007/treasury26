@@ -59,7 +59,6 @@ import {
 } from "@tanstack/react-table";
 import { VoteModal } from "./vote-modal";
 import { Address } from "@/components/address";
-import { DepositModal } from "@/app/(treasury)/[treasuryId]/dashboard/components/deposit-modal";
 import { EmptyState } from "@/components/empty-state";
 import { AuthButton } from "@/components/auth-button";
 import { useRouter } from "next/navigation";
@@ -426,11 +425,6 @@ export function ProposalsTable({
     });
 
     const [isVoteModalOpen, setIsVoteModalOpen] = useState(false);
-    const [isDepositModalOpen, setIsDepositModalOpen] = useState(false);
-    const [{ tokenSymbol, tokenNetwork }, setDepositTokenInfo] = useState<{
-        tokenSymbol?: string;
-        tokenNetwork?: string;
-    }>({});
     const [voteInfo, setVoteInfo] = useState<{
         vote: "Approve" | "Reject" | "Remove";
         proposals: Proposal[];
@@ -632,12 +626,28 @@ export function ProposalsTable({
                                                         tokenSymbol,
                                                         tokenNetwork,
                                                     ) => {
-                                                        setDepositTokenInfo({
-                                                            tokenSymbol,
-                                                            tokenNetwork,
-                                                        });
-                                                        setIsDepositModalOpen(
-                                                            true,
+                                                        const params =
+                                                            new URLSearchParams();
+                                                        if (tokenSymbol) {
+                                                            params.set(
+                                                                "token",
+                                                                tokenSymbol,
+                                                            );
+                                                        }
+                                                        if (tokenNetwork) {
+                                                            params.set(
+                                                                "network",
+                                                                tokenNetwork,
+                                                            );
+                                                        }
+                                                        const query =
+                                                            params.toString();
+                                                        router.push(
+                                                            `/${treasuryId}/dashboard/deposit${
+                                                                query
+                                                                    ? `?${query}`
+                                                                    : ""
+                                                            }`,
                                                         );
                                                     }}
                                                 />
@@ -671,12 +681,6 @@ export function ProposalsTable({
                 proposals={voteInfo.proposals}
                 vote={voteInfo.vote}
                 insufficientBalanceProposalIds={voteInfo.insufficientBalanceIds}
-            />
-            <DepositModal
-                isOpen={isDepositModalOpen}
-                onClose={() => setIsDepositModalOpen(false)}
-                prefillTokenSymbol={tokenSymbol}
-                prefillNetworkId={tokenNetwork}
             />
         </>
     );

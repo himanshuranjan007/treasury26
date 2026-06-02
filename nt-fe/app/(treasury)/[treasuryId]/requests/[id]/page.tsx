@@ -1,10 +1,9 @@
 "use client";
 
-import { redirect } from "next/navigation";
+import { redirect, useRouter } from "next/navigation";
 import { useTranslations } from "next-intl";
 import { trackEvent } from "@/lib/analytics";
 import { use, useEffect, useState } from "react";
-import { DepositModal } from "@/app/(treasury)/[treasuryId]/dashboard/components/deposit-modal";
 import { PageCard } from "@/components/card";
 import { PageComponentLayout } from "@/components/page-component-layout";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -44,6 +43,7 @@ export default function RequestPage({ params }: RequestPageProps) {
     const t = useTranslations("pages.requests");
     const { id } = use(params);
     const { treasuryId } = useTreasury();
+    const router = useRouter();
     const cachedSubmissionTime = useCachedProposalSubmissionTime(
         treasuryId,
         id,
@@ -53,9 +53,9 @@ export default function RequestPage({ params }: RequestPageProps) {
         id,
     );
     const submissionTime = proposal?.submission_time ?? cachedSubmissionTime;
-    const canLoadPolicy = !!treasuryId && !!submissionTime;
+    const canLoadPolicy = !!submissionTime;
     const { data: policy, isLoading: isLoadingPolicy } = useTreasuryPolicy(
-        canLoadPolicy ? treasuryId : null,
+        canLoadPolicy ? treasuryId! : null,
         submissionTime,
     );
 
@@ -63,17 +63,12 @@ export default function RequestPage({ params }: RequestPageProps) {
         if (proposal) {
             trackEvent("request-detail-viewed", {
                 proposal_id: proposal.id,
-                treasury_id: treasuryId ?? "",
+                treasury_id: treasuryId!,
             });
         }
     }, [proposal?.id, proposal, treasuryId]);
 
     const [isVoteModalOpen, setIsVoteModalOpen] = useState(false);
-    const [isDepositModalOpen, setIsDepositModalOpen] = useState(false);
-    const [{ tokenSymbol, tokenNetwork }, setDepositTokenInfo] = useState<{
-        tokenSymbol?: string;
-        tokenNetwork?: string;
-    }>({});
     const [voteInfo, setVoteInfo] = useState<{
         vote: "Approve" | "Reject" | "Remove";
         proposals: Proposal[];
@@ -117,8 +112,19 @@ export default function RequestPage({ params }: RequestPageProps) {
                     setIsVoteModalOpen(true);
                 }}
                 onDeposit={(tokenSymbol, tokenNetwork) => {
-                    setDepositTokenInfo({ tokenSymbol, tokenNetwork });
-                    setIsDepositModalOpen(true);
+                    const params = new URLSearchParams();
+                    if (tokenSymbol) {
+                        params.set("token", tokenSymbol);
+                    }
+                    if (tokenNetwork) {
+                        params.set("network", tokenNetwork);
+                    }
+                    const query = params.toString();
+                    router.push(
+                        `/${treasuryId}/dashboard/deposit${
+                            query ? `?${query}` : ""
+                        }`,
+                    );
                 }}
             />
             <VoteModal
@@ -126,12 +132,6 @@ export default function RequestPage({ params }: RequestPageProps) {
                 onClose={() => setIsVoteModalOpen(false)}
                 proposals={voteInfo.proposals}
                 vote={voteInfo.vote}
-            />
-            <DepositModal
-                isOpen={isDepositModalOpen}
-                onClose={() => setIsDepositModalOpen(false)}
-                prefillTokenSymbol={tokenSymbol}
-                prefillNetworkId={tokenNetwork}
             />
         </PageComponentLayout>
     );
