@@ -105,7 +105,8 @@
         "wallet": "Ví",
         "termsOfService": "Điều khoản dịch vụ",
         "privacyPolicy": "Chính sách bảo mật",
-        "disconnect": "Ngắt kết nối"
+        "disconnect": "Ngắt kết nối",
+        "disconnectWallet": "Ngắt kết nối Ví"
     },
     "auth": {
         "noWallet": "Kết nối ví của bạn",
@@ -2160,7 +2161,7 @@
             "suffixDemo": "xem demo.",
             "suffixExploring": "tiếp tục khám phá.",
             "createCta": "Tạo một Ngân quỹ",
-            "viewDemo": "Xem Demo",
+            "viewDemo": "Khám phá Trezu Demo",
             "keepExploring": "Tiếp tục khám phá"
         },
         "infoBox": {

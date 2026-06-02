@@ -105,7 +105,8 @@
         "wallet": "钱包",
         "termsOfService": "服务条款",
         "privacyPolicy": "隐私政策",
-        "disconnect": "断开连接"
+        "disconnect": "断开连接",
+        "disconnectWallet": "断开连接 钱包"
     },
     "auth": {
         "noWallet": "请连接您的钱包",
@@ -2160,7 +2161,7 @@
             "suffixDemo": "查看演示。",
             "suffixExploring": "继续探索。",
             "createCta": "创建金库",
-            "viewDemo": "查看演示",
+            "viewDemo": "探索 Trezu 演示",
             "keepExploring": "继续探索"
         },
         "infoBox": {

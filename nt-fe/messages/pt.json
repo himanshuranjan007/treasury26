@@ -105,7 +105,8 @@
         "wallet": "Carteira",
         "termsOfService": "Termos de Serviço",
         "privacyPolicy": "Política de Privacidade",
-        "disconnect": "Desconectar"
+        "disconnect": "Desconectar",
+        "disconnectWallet": "Desconectar Carteira"
     },
     "auth": {
         "noWallet": "Conecte sua carteira",
@@ -2160,7 +2161,7 @@
             "suffixDemo": "veja a demonstração.",
             "suffixExploring": "continue explorando.",
             "createCta": "Criar uma tesouraria",
-            "viewDemo": "Ver demonstração",
+            "viewDemo": "Explore a demonstração da Trezu",
             "keepExploring": "Continuar explorando"
         },
         "infoBox": {

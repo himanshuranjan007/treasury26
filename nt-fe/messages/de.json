@@ -105,7 +105,8 @@
         "wallet": "Wallet",
         "termsOfService": "Nutzungsbedingungen",
         "privacyPolicy": "Datenschutzerklärung",
-        "disconnect": "Trennen"
+        "disconnect": "Trennen",
+        "disconnectWallet": "Trennen Wallet"
     },
     "auth": {
         "noWallet": "Verbinden Sie Ihre Wallet",
@@ -2160,7 +2161,7 @@
             "suffixDemo": "sehen Sie sich die Demo an.",
             "suffixExploring": "erkunden Sie weiter.",
             "createCta": "Treasury erstellen",
-            "viewDemo": "Demo ansehen",
+            "viewDemo": "Trezu-Demo erkunden",
             "keepExploring": "Weiter erkunden"
         },
         "infoBox": {
