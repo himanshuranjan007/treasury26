@@ -106,6 +106,12 @@ const DIRECT_TRIGGER_WALLET_IDS = [
 // localStorage key @hot-labs/near-connect uses to remember the chosen wallet
 // (so `connector.wallet()` resolves it on later calls and after reload).
 const SELECTED_WALLET_STORAGE_KEY = "selected-wallet";
+// Our own copy of the forced direct-trigger wallet id (Ledger / EIP-712).
+// SELECTED_WALLET_STORAGE_KEY alone isn't enough: on reload the connector must
+// be rebuilt INCLUDING that wallet (not excluded), otherwise `connector.wallet()`
+// can't resolve it and the user is signed out. We persist the forced target
+// here and restore it on bare init().
+const TARGET_WALLET_STORAGE_KEY = "trezu:target-wallet";
 
 // WalletConnect Core must be initialized exactly once per page. The connector
 // is rebuilt whenever the excluded-wallet set changes (e.g. switching to the
@@ -197,17 +203,34 @@ export const useNearStore = create<NearStore>((set, get) => ({
 
     init: async (options) => {
         const { connector, connectorExcludeKey } = get();
-        const targetWalletId = options?.targetWalletId;
 
-        // Exclude every direct-trigger wallet except the one being connected.
-        const excludedWallets = DIRECT_TRIGGER_WALLET_IDS.filter(
-            (id) => id !== targetWalletId,
-        );
+        // On a bare init() (app bootstrap / auth check, e.g. after a page
+        // reload) restore the previously forced direct-trigger wallet from our
+        // dedicated key, so the rebuilt connector still includes it and
+        // `connector.wallet()` can resolve the session. Explicit connect() calls
+        // pass an options object and control the target themselves.
+        const persistedTarget =
+            typeof window !== "undefined"
+                ? window.localStorage.getItem(TARGET_WALLET_STORAGE_KEY)
+                : null;
+        const restoredTarget =
+            persistedTarget &&
+            DIRECT_TRIGGER_WALLET_IDS.includes(persistedTarget)
+                ? persistedTarget
+                : undefined;
+        const targetWalletId =
+            options === undefined ? restoredTarget : options.targetWalletId;
+
+        // Only the generic "NEAR" path (no forced wallet) excludes the
+        // direct-trigger wallets from the selector popup. Forcing a specific
+        // wallet (Ledger / EIP-712) excludes nothing.
+        const excludedWallets = targetWalletId
+            ? []
+            : [...DIRECT_TRIGGER_WALLET_IDS];
         const excludeKey = excludedWallets.join(",");
 
-        // Reuse the existing connector when no specific wallet is targeted
-        // (callers that just need a connector to read accounts), or when its
-        // exclusion set already matches what we need.
+        // Reuse the existing connector when its exclusion set already matches
+        // what we need, or when no specific wallet is targeted.
         if (
             connector &&
             (targetWalletId === undefined || connectorExcludeKey === excludeKey)
@@ -287,6 +310,17 @@ export const useNearStore = create<NearStore>((set, get) => ({
                     SELECTED_WALLET_STORAGE_KEY,
                     selectedWalletId,
                 );
+                // Persist direct-trigger wallets under our own key so the
+                // connector is rebuilt including them after a reload. Clear it
+                // for generic NEAR wallets, which need no special inclusion.
+                if (DIRECT_TRIGGER_WALLET_IDS.includes(selectedWalletId)) {
+                    window.localStorage.setItem(
+                        TARGET_WALLET_STORAGE_KEY,
+                        selectedWalletId,
+                    );
+                } else {
+                    window.localStorage.removeItem(TARGET_WALLET_STORAGE_KEY);
+                }
             }
             const wallet = await newConnector.wallet(selectedWalletId);
 
@@ -356,6 +390,12 @@ export const useNearStore = create<NearStore>((set, get) => ({
             authError: null,
         });
         posthog.reset();
+
+        // Forget the persisted direct-trigger wallet so the next reload doesn't
+        // restore a stale target.
+        if (typeof window !== "undefined") {
+            window.localStorage.removeItem(TARGET_WALLET_STORAGE_KEY);
+        }
 
         // Disconnect wallet
         if (connector) {
