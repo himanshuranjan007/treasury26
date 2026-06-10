@@ -291,7 +291,7 @@ export function CreateTreasuryEntry() {
         }
     };
 
-    const unauthHeaderLogo = <Logo size="sm" />;
+    const unauthHeaderLogo = <Logo size="md" />;
 
     if (isInitializing) {
         return <LoadingScreen />;
@@ -314,9 +314,11 @@ export function CreateTreasuryEntry() {
                             onSubmit={form.handleSubmit(onSubmit)}
                             className="space-y-4"
                         >
-                            <h1 className="text-lg font-semibold mb-3">
-                                {tPages("title")}
-                            </h1>
+                            {!accountId && (
+                                <h1 className="text-lg font-semibold mb-3">
+                                    {tPages("title")}
+                                </h1>
+                            )}
                             <p className="text-md text-muted-foreground">
                                 {t("selectTreasuryTypeLabel")}
                             </p>
@@ -657,6 +659,7 @@ export function CreateTreasuryEntry() {
                 <PageComponentLayout
                     title={tPages("title")}
                     description={t("headerDescription")}
+                    backButton={shouldStayOnCreatePage}
                     hideCollapseButton
                     hideSystemStatusBanner
                     transparentHeader
