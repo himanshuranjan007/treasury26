@@ -102,10 +102,10 @@ async fn async_main() {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(45u64);
 
-            log::info!(
-                "Starting confidential poll worker ({}s interval, {}s initial delay)",
-                interval_secs,
-                initial_delay
+            tracing::info!(
+                interval_secs = interval_secs,
+                initial_delay_secs = initial_delay,
+                "Starting confidential poll worker"
             );
 
             tokio::time::sleep(Duration::from_secs(initial_delay)).await;
@@ -113,7 +113,7 @@ async fn async_main() {
             loop {
                 timer.tick().await;
                 if let Err(e) = run_confidential_poll_cycle(&state_clone).await {
-                    log::error!("[confidential-poll] cycle failed: {}", e);
+                    tracing::error!(error = %e, "confidential poll cycle failed");
                 }
             }
         });
@@ -129,6 +129,18 @@ async fn async_main() {
             nt_be::services::run_price_sync_service(pool, provider).await;
         });
     }
+
+    nt_be::handlers::intents::confidential::bronze::ingest_worker::spawn_confidential_history_worker(
+        state.clone(),
+    );
+
+    nt_be::handlers::intents::confidential::gold::snapshots::spawn_confidential_snapshot_worker(
+        state.clone(),
+    );
+
+    nt_be::handlers::intents::confidential::gold::reconciliation_worker::spawn_confidential_gold_reconciliation_worker(
+        state.db_pool.clone(),
+    );
 
     // TODO: Re-enable once we have a DefiLlama API key or higher rate limit
     // Spawn usd_value backfill service
@@ -175,69 +187,9 @@ async fn async_main() {
         });
     }
 
-    // Spawn Goldsky enrichment worker (reads from Goldsky sink DB, writes to app DB)
-    if let Some(goldsky_pool) = &state.goldsky_pool {
-        let goldsky_pool = goldsky_pool.clone();
-        let app_pool = state.db_pool.clone();
-        let network = state.archival_network.clone();
-        let intents_api_key = state.env_vars.intents_explorer_api_key.clone();
-        let intents_api_url = state.env_vars.intents_explorer_api_url.clone();
-        tokio::spawn(async move {
-            use nt_be::handlers::balance_changes::goldsky_enrichment::run_enrichment_cycle;
-
-            const BATCH_SIZE: usize = 100;
-            let enrichment_initial_delay = std::env::var("ENRICHMENT_INITIAL_DELAY_SECONDS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(10u64);
-            let enrichment_interval = std::env::var("ENRICHMENT_INTERVAL_SECONDS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(15u64);
-            log::info!(
-                "Starting Goldsky enrichment worker ({}s interval, {}s initial delay)",
-                enrichment_interval,
-                enrichment_initial_delay
-            );
-
-            // Wait for server to fully start
-            tokio::time::sleep(Duration::from_secs(enrichment_initial_delay)).await;
-
-            loop {
-                let should_sleep = {
-                    match run_enrichment_cycle(
-                        &goldsky_pool,
-                        &app_pool,
-                        &network,
-                        intents_api_key.as_deref(),
-                        &intents_api_url,
-                    )
-                    .await
-                    {
-                        Ok(processed) => {
-                            if processed > 0 {
-                                log::info!(
-                                    "[goldsky-enrichment] Processed {} outcomes this cycle",
-                                    processed
-                                );
-                            }
-                            // If batch was full, there's likely more data — skip the sleep
-                            processed < BATCH_SIZE
-                        }
-                        Err(e) => {
-                            log::error!("[goldsky-enrichment] Enrichment cycle failed: {}", e);
-                            true
-                        }
-                    }
-                };
-                if should_sleep {
-                    tokio::time::sleep(Duration::from_secs(enrichment_interval)).await;
-                }
-            }
-        });
-    } else {
-        log::info!("Goldsky enrichment worker disabled (GOLDSKY_DATABASE_URL not set)");
-    }
+    nt_be::handlers::balance_changes::goldsky_enrichment::spawn_goldsky_enrichment_worker(
+        state.clone(),
+    );
 
     // Spawn notification worker (event detection + Telegram dispatch)
     nt_be::handlers::notifications::run_notification_loop(

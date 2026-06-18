@@ -8,7 +8,7 @@
 //! - App DB (read-write): `balance_changes` + `goldsky_cursors` for progress tracking
 //!
 //! Idempotent: uses INSERT ... ON CONFLICT DO UPDATE so replays overwrite
-//! with potentially higher-quality data.
+//! with potentially higher-quality data
 
 use super::balance::get_balance_change_at_block;
 use super::counterparty::ensure_ft_metadata;
@@ -17,6 +17,13 @@ use super::swap_detector::{
 };
 use super::transfer_hints::tx_resolver::{TxActionInfo, resolve_receipt_block_height};
 use super::utils::block_timestamp_to_datetime;
+use crate::AppState;
+use crate::handlers::intents::confidential::bronze::store::{
+    link_intent_to_history_event, mark_confidential_history_activity_due,
+};
+use crate::handlers::intents::confidential::gold::history_events::refresh_gold_metadata_for_intent;
+use crate::handlers::proposals::scraper::{extract_payload_hash_from_kind, fetch_proposal};
+use base64::Engine;
 use bigdecimal::Zero;
 use near_api::NetworkConfig;
 use serde::Deserialize;
@@ -105,8 +112,8 @@ async fn get_cursor(
 
             match latest {
                 Some((id, block)) => {
-                    log::info!(
-                        "[goldsky-enrichment] No cursor found, seeding from latest block {} in Goldsky sink",
+                    tracing::info!(
+                        "No cursor found, seeding from latest block {} in Goldsky sink",
                         block
                     );
                     update_cursor(app_pool, consumer_name, &id, block).await?;
@@ -246,10 +253,7 @@ fn parse_log_events(logs: &str, executor_id: &str) -> Vec<ParsedEvent> {
                         events.extend(parse_nep245_event(&event, executor_id));
                     }
                     _ => {
-                        log::debug!(
-                            "[goldsky-enrichment] Unknown event standard: {}",
-                            event.standard
-                        );
+                        tracing::debug!("Unknown event standard: {}", event.standard);
                     }
                 }
             }
@@ -527,6 +531,188 @@ async fn get_monitored_accounts(
     Ok(rows.into_iter().collect())
 }
 
+pub(crate) fn decode_success_value_u64(status: &str) -> Option<u64> {
+    fn extract_encoded(status: &str) -> Option<String> {
+        let status = status.trim();
+        if status.is_empty() {
+            return None;
+        }
+
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(status) {
+            return value
+                .get("SuccessValue")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string);
+        }
+
+        let inner = status
+            .strip_prefix("SuccessValue(")?
+            .strip_suffix(')')?
+            .trim();
+        let encoded = inner.strip_prefix('"')?.strip_suffix('"')?.trim();
+        (!encoded.is_empty()).then(|| encoded.to_string())
+    }
+
+    let encoded = extract_encoded(status)?;
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    decoded.trim().parse::<u64>().ok()
+}
+
+fn confidential_dao_for_outcome(
+    outcome: &IndexedDaoOutcome,
+    monitored: &std::collections::HashMap<String, bool>,
+) -> Option<String> {
+    if matches!(monitored.get(&outcome.executor_id), Some(true)) {
+        return Some(outcome.executor_id.clone());
+    }
+
+    let receiver_id = outcome.receiver_id.as_deref()?;
+    if matches!(monitored.get(receiver_id), Some(true)) {
+        return Some(receiver_id.to_string());
+    }
+
+    None
+}
+
+async fn update_confidential_intent_proposal(
+    app_pool: &PgPool,
+    dao_id: &str,
+    payload_hash: &str,
+    proposal_id: u64,
+    proposal_created_at: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let proposal_id = i64::try_from(proposal_id)?;
+    let result = sqlx::query(
+        r#"
+        UPDATE confidential_intents
+        SET proposal_id = COALESCE(proposal_id, $3),
+            proposal_created_at = COALESCE(proposal_created_at, $4),
+            updated_at = NOW()
+        WHERE dao_id = $1
+          AND payload_hash = $2
+        "#,
+    )
+    .bind(dao_id)
+    .bind(payload_hash)
+    .bind(proposal_id)
+    .bind(proposal_created_at)
+    .execute(app_pool)
+    .await?;
+
+    if result.rows_affected() > 0 {
+        if let Some(history_event_id) =
+            link_intent_to_history_event(app_pool, dao_id, payload_hash).await?
+        {
+            tracing::info!(
+                "linked proposal intent {}/{} to history_event_id={}",
+                dao_id,
+                payload_hash,
+                history_event_id
+            );
+        }
+        refresh_gold_metadata_for_intent(app_pool, dao_id, payload_hash).await?;
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+async fn handle_confidential_add_proposal(
+    app_pool: &PgPool,
+    network: &NetworkConfig,
+    dao_id: &str,
+    proposal_id: u64,
+    proposal_created_at: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let dao_account: near_api::AccountId = match dao_id.parse() {
+        Ok(account) => account,
+        Err(e) => {
+            tracing::warn!(
+                "invalid DAO account id for proposal lookup {}: {}",
+                dao_id,
+                e
+            );
+            return Ok(false);
+        }
+    };
+
+    let proposal = match fetch_proposal(network, &dao_account, proposal_id).await {
+        Ok(proposal) => proposal,
+        Err(e) => {
+            tracing::warn!(
+                "failed to fetch proposal {}/{}: {:?}",
+                dao_id,
+                proposal_id,
+                e
+            );
+            return Ok(false);
+        }
+    };
+
+    let Some(payload_hash) = extract_payload_hash_from_kind(&proposal.kind) else {
+        return Ok(false);
+    };
+
+    let updated = update_confidential_intent_proposal(
+        app_pool,
+        dao_id,
+        &payload_hash,
+        proposal_id,
+        proposal_created_at,
+    )
+    .await?;
+
+    if updated {
+        tracing::info!(
+            "linked confidential proposal {}/{} to payload_hash={}",
+            dao_id,
+            proposal_id,
+            payload_hash
+        );
+    }
+
+    Ok(updated)
+}
+
+/// Keep the Goldsky cursor moving; history polling and Gold projection run in
+/// the confidential-history scheduler.
+async fn mark_confidential_history_due_for_execution(
+    history_state: Option<&AppState>,
+    monitored: &std::collections::HashMap<String, bool>,
+    dao_id: &str,
+    recipient: Option<&str>,
+) {
+    let Some(state) = history_state else {
+        return;
+    };
+
+    if let Err(e) = mark_confidential_history_activity_due(&state.db_pool, dao_id).await {
+        tracing::warn!("cannot mark confidential history due for {}: {}", dao_id, e);
+    }
+
+    let Some(recipient) = recipient else {
+        return;
+    };
+    if recipient == dao_id {
+        return;
+    }
+    if matches!(monitored.get(recipient), Some(true))
+        && let Err(e) = mark_confidential_history_activity_due(&state.db_pool, recipient).await
+    {
+        tracing::warn!(
+            "cannot mark confidential history due for {}: {}",
+            recipient,
+            e
+        );
+    }
+}
+
 /// Run one enrichment cycle: fetch unprocessed outcomes from Goldsky sink, enrich with RPC,
 /// write to app DB.
 ///
@@ -538,6 +724,7 @@ pub async fn run_enrichment_cycle(
     network: &NetworkConfig,
     intents_api_key: Option<&str>,
     intents_api_url: &str,
+    history_state: Option<&AppState>,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let http_client = reqwest::Client::new();
     let consumer_name = "balance_enrichment";
@@ -567,8 +754,8 @@ pub async fn run_enrichment_cycle(
     }
 
     let batch_size = outcomes.len();
-    log::info!(
-        "[goldsky-enrichment] Processing batch of {} outcomes (cursor: block={}, id={})",
+    tracing::info!(
+        "Processing batch of {} outcomes (cursor: block={}, id={})",
         batch_size,
         cursor.last_processed_block,
         if cursor.last_processed_id.is_empty() {
@@ -600,6 +787,32 @@ pub async fn run_enrichment_cycle(
         let block_time = block_timestamp_to_datetime(block_timestamp_nanos);
         let block_height = outcome.trigger_block_height as u64;
 
+        if let Some(status) = outcome.status.as_deref()
+            && let Some(proposal_id) = decode_success_value_u64(status)
+            && let Some(dao_id) = confidential_dao_for_outcome(outcome, &monitored)
+        {
+            match handle_confidential_add_proposal(
+                app_pool,
+                network,
+                &dao_id,
+                proposal_id,
+                block_time,
+            )
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::error!(
+                        "confidential proposal linkage failed for {}/{}: {}",
+                        dao_id,
+                        proposal_id,
+                        e
+                    );
+                }
+            }
+        }
+
         // Confidential DAO short-circuit (runs before the normal event loop):
         // v1.signer emits exactly one `sign: predecessor=AccountId("…"),
         // request=…payload_v2: Some(Eddsa(Bytes("…")))` log per executed
@@ -610,6 +823,28 @@ pub async fn run_enrichment_cycle(
             && let Some(call) = super::confidential_enrichment::extract_sign_call_from_logs(logs)
             && matches!(monitored.get(&call.dao_id), Some(true))
         {
+            let submitted_intent =
+                match super::confidential_enrichment::mark_confidential_intent_submitted(
+                    app_pool,
+                    &call.dao_id,
+                    &call.payload_hash,
+                    block_time,
+                    Some(block_height as i64),
+                    outcome.transaction_hash.as_deref(),
+                )
+                .await
+                {
+                    Ok(info) => info,
+                    Err(e) => {
+                        tracing::error!(
+                            "failed to mark confidential intent submitted for {}: {}",
+                            call.dao_id,
+                            e
+                        );
+                        None
+                    }
+                };
+
             match super::confidential_enrichment::handle_confidential_outgoing(
                 app_pool,
                 network,
@@ -628,13 +863,18 @@ pub async fn run_enrichment_cycle(
                 }
                 Ok(false) => {}
                 Err(e) => {
-                    log::error!(
-                        "[goldsky-enrichment] confidential outgoing failed for {}: {}",
-                        call.dao_id,
-                        e
-                    );
+                    tracing::error!("confidential outgoing failed for {}: {}", call.dao_id, e);
                 }
             }
+            mark_confidential_history_due_for_execution(
+                history_state,
+                &monitored,
+                &call.dao_id,
+                submitted_intent
+                    .as_ref()
+                    .and_then(|info| info.recipient.as_deref()),
+            )
+            .await;
             last_processed_id = outcome.id.clone();
             last_processed_block = outcome.trigger_block_height;
             continue;
@@ -676,8 +916,8 @@ pub async fn run_enrichment_cycle(
                 .await
                 {
                     Ok((block, action_info)) => {
-                        log::debug!(
-                            "[goldsky-enrichment] receipt {} → block {:?} (trigger was {})",
+                        tracing::debug!(
+                            "receipt {} → block {:?} (trigger was {})",
                             outcome.id,
                             block,
                             block_height,
@@ -685,8 +925,8 @@ pub async fn run_enrichment_cycle(
                         (block, action_info)
                     }
                     Err(e) => {
-                        log::warn!(
-                            "[goldsky-enrichment] Failed to resolve receipt {}: {} — using trigger block",
+                        tracing::warn!(
+                            "Failed to resolve receipt {}: {} — using trigger block",
                             outcome.id,
                             e,
                         );
@@ -702,10 +942,7 @@ pub async fn run_enrichment_cycle(
 
         for event in &events {
             if !monitored.contains_key(&event.account_id) {
-                log::warn!(
-                    "[goldsky-enrichment] Unmonitored account {}",
-                    event.account_id
-                );
+                tracing::warn!("Unmonitored account {}", event.account_id);
             }
 
             // Ensure FT metadata is cached (needed for decimal conversion in RPC balance queries)
@@ -714,8 +951,8 @@ pub async fn run_enrichment_cycle(
                 && !event.token_id.contains(':')
                 && let Err(e) = ensure_ft_metadata(app_pool, network, &event.token_id).await
             {
-                log::warn!(
-                    "[goldsky-enrichment] Failed to ensure FT metadata for {}: {} — skipping",
+                tracing::warn!(
+                    "Failed to ensure FT metadata for {}: {} — skipping",
                     event.token_id,
                     e
                 );
@@ -735,8 +972,8 @@ pub async fn run_enrichment_cycle(
             {
                 Ok((bb, ba)) => (check_block, bb, ba),
                 Err(e) => {
-                    log::warn!(
-                        "[goldsky-enrichment] RPC error for {}/{} at block {}: {} — skipping",
+                    tracing::warn!(
+                        "RPC error for {}/{} at block {}: {} — skipping",
                         event.account_id,
                         event.token_id,
                         check_block,
@@ -817,8 +1054,8 @@ pub async fn run_enrichment_cycle(
             .await
             {
                 Ok(_) => {
-                    log::info!(
-                        "[goldsky-enrichment] Upserted {}/{} at block {} amount={}",
+                    tracing::info!(
+                        "Upserted {}/{} at block {} amount={}",
                         event.account_id,
                         event.token_id,
                         actual_block,
@@ -829,8 +1066,8 @@ pub async fn run_enrichment_cycle(
                         swap_candidate_accounts.insert(event.account_id.clone());
                     }
                 }
-                Err(e) => log::error!(
-                    "[goldsky-enrichment] Failed to upsert {}/{} at block {}: {}",
+                Err(e) => tracing::error!(
+                    "Failed to upsert {}/{} at block {}: {}",
                     event.account_id,
                     event.token_id,
                     block_height,
@@ -872,27 +1109,15 @@ pub async fn run_enrichment_cycle(
         {
             Ok(swaps) if !swaps.is_empty() => match store_detected_swaps(app_pool, &swaps).await {
                 Ok(inserted) if inserted > 0 => {
-                    log::info!(
-                        "[goldsky-enrichment] Detected and stored {} swaps for {}",
-                        inserted,
-                        account_id
-                    );
+                    tracing::info!("Detected and stored {} swaps for {}", inserted, account_id);
                 }
                 Err(e) => {
-                    log::error!(
-                        "[goldsky-enrichment] Error storing swaps for {}: {}",
-                        account_id,
-                        e
-                    );
+                    tracing::error!("Error storing swaps for {}: {}", account_id, e);
                 }
                 _ => {}
             },
             Err(e) => {
-                log::error!(
-                    "[goldsky-enrichment] Error detecting swaps for {}: {}",
-                    account_id,
-                    e
-                );
+                tracing::error!("Error detecting swaps for {}: {}", account_id, e);
             }
             _ => {}
         }
@@ -900,15 +1125,15 @@ pub async fn run_enrichment_cycle(
         // Classify DAO proposal-based swap deposits
         match classify_proposal_swap_deposits(app_pool, network, account_id).await {
             Ok(count) if count > 0 => {
-                log::info!(
-                    "[goldsky-enrichment] Classified {} proposal swap deposits for {}",
+                tracing::info!(
+                    "Classified {} proposal swap deposits for {}",
                     count,
                     account_id
                 );
             }
             Err(e) => {
-                log::warn!(
-                    "[goldsky-enrichment] Error classifying proposal swap deposits for {}: {}",
+                tracing::warn!(
+                    "Error classifying proposal swap deposits for {}: {}",
                     account_id,
                     e
                 );
@@ -917,14 +1142,76 @@ pub async fn run_enrichment_cycle(
         }
     }
 
-    log::info!(
-        "[goldsky-enrichment] Batch complete: {} outcomes, cursor now at block={}, id={}",
+    tracing::info!(
+        "Batch complete: {} outcomes, cursor now at block={}, id={}",
         batch_size,
         last_processed_block,
         last_processed_id,
     );
 
     Ok(batch_size)
+}
+
+/// Background worker: reads outcomes from the Goldsky sink DB, writes enriched
+/// balance_changes to the app DB. If the previous batch was full, skip the
+/// sleep — there's likely more data waiting. Disabled when no Goldsky pool is
+/// configured (logs once and returns).
+pub fn spawn_goldsky_enrichment_worker(state: std::sync::Arc<AppState>) {
+    let Some(goldsky_pool) = state.goldsky_pool.clone() else {
+        tracing::info!("Goldsky enrichment worker disabled (GOLDSKY_DATABASE_URL not set)");
+        return;
+    };
+
+    tokio::spawn(async move {
+        const BATCH_SIZE: usize = 100;
+        let enrichment_initial_delay = std::env::var("ENRICHMENT_INITIAL_DELAY_SECONDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10u64);
+        let enrichment_interval = std::env::var("ENRICHMENT_INTERVAL_SECONDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(15u64);
+        tracing::info!(
+            "Starting Goldsky enrichment worker ({}s interval, {}s initial delay)",
+            enrichment_interval,
+            enrichment_initial_delay
+        );
+
+        tokio::time::sleep(std::time::Duration::from_secs(enrichment_initial_delay)).await;
+
+        let app_pool = state.db_pool.clone();
+        let network = state.archival_network.clone();
+        let intents_api_key = state.env_vars.intents_explorer_api_key.clone();
+        let intents_api_url = state.env_vars.intents_explorer_api_url.clone();
+
+        loop {
+            let should_sleep = match run_enrichment_cycle(
+                &goldsky_pool,
+                &app_pool,
+                &network,
+                intents_api_key.as_deref(),
+                &intents_api_url,
+                Some(&state),
+            )
+            .await
+            {
+                Ok(processed) => {
+                    if processed > 0 {
+                        tracing::info!("Processed {} outcomes this cycle", processed);
+                    }
+                    processed < BATCH_SIZE
+                }
+                Err(e) => {
+                    tracing::error!("Enrichment cycle failed: {}", e);
+                    true
+                }
+            };
+            if should_sleep {
+                tokio::time::sleep(std::time::Duration::from_secs(enrichment_interval)).await;
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -934,6 +1221,36 @@ pub async fn run_enrichment_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_decode_success_value_proposal_id() {
+        assert_eq!(
+            decode_success_value_u64(r#"SuccessValue("MTE=")"#),
+            Some(11)
+        );
+        assert_eq!(
+            decode_success_value_u64(r#"{"SuccessValue":"MTM2"}"#),
+            Some(136)
+        );
+        assert_eq!(
+            decode_success_value_u64(r#"  {"SuccessValue":"IDEyMyA="}  "#),
+            Some(123)
+        );
+        assert_eq!(decode_success_value_u64(r#"SuccessValue("")"#), None);
+        assert_eq!(
+            decode_success_value_u64(r#"{"SuccessReceiptId":"abc"}"#),
+            None
+        );
+        assert_eq!(decode_success_value_u64(r#"garbage "MTE=""#), None);
+        assert_eq!(
+            decode_success_value_u64(r#"SuccessValue("not-base64")"#),
+            None
+        );
+        assert_eq!(
+            decode_success_value_u64(r#"{"SuccessValue":"bm90LWEtbnVtYmVy"}"#),
+            None
+        );
+    }
 
     #[test]
     fn test_parse_nep141_ft_transfer_to_dao() {

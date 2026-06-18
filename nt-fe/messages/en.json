@@ -367,6 +367,7 @@
             "pending": "Pending",
             "type": "Type",
             "date": "Date",
+            "request": "Request",
             "from": "From",
             "to": "To",
             "method": "Method",

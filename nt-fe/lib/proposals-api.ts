@@ -260,6 +260,13 @@ export interface Proposal {
         status?: string;
         correlation_id?: string;
         notes?: string;
+        proposal_created_at?: string | null;
+        proposal_executed_at?: string | null;
+        gold_metadata?: {
+            amount_in_usd?: string | null;
+            amount_out_usd?: string | null;
+            usd_change?: string | null;
+        };
     };
 }
 

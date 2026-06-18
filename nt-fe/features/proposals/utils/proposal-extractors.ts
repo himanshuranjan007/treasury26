@@ -58,6 +58,15 @@ function normalizeTimeEstimateSeconds(value?: string): string | undefined {
     return undefined;
 }
 
+function parseUsdValue(value?: string | null): number | null {
+    if (value == null) {
+        return null;
+    }
+
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
 function extractFTTransferData(
     functionCall: FunctionCallKind["FunctionCall"],
     actions: FunctionCallAction[],
@@ -826,6 +835,8 @@ export function extractConfidentialRequestData(
 
     const meta = proposal.confidential_metadata;
     const quoteMeta = meta?.quote_metadata;
+    const goldAmountInUsd = parseUsdValue(meta?.gold_metadata?.amount_in_usd);
+    const goldAmountOutUsd = parseUsdValue(meta?.gold_metadata?.amount_out_usd);
 
     let mapped: MappedConfidentialRequest = null;
     let title = "Confidential Request";
@@ -848,10 +859,10 @@ export function extractConfidentialRequestData(
                     depositAddress: quote.depositAddress,
                     tokenInAddress: quoteRequest.originAsset,
                     amountIn: quote.amountIn,
+                    amountInUsd: goldAmountInUsd,
                     tokenOutAddress: quoteRequest.destinationAsset,
                     amountOut: quote.amountOutFormatted,
-                    quoteAmountInUsd: quote.amountInUsd,
-                    quoteAmountOutUsd: quote.amountOutUsd,
+                    amountOutUsd: goldAmountOutUsd,
                     slippage: (
                         (quoteRequest.slippageTolerance ?? 0) / 100
                     ).toString(),
@@ -883,6 +894,7 @@ export function extractConfidentialRequestData(
                     depositAddress: quote.depositAddress,
                     quoteSignature: quoteResponse.signature,
                     networkFee,
+                    usdValue: goldAmountInUsd,
                     destinationAssetId,
                 } as PaymentRequestData,
             };
@@ -894,6 +906,8 @@ export function extractConfidentialRequestData(
         correlationId,
         payloadHash,
         status: meta?.status,
+        proposalCreatedAt: meta?.proposal_created_at,
+        executedAt: meta?.proposal_executed_at,
         mapped,
         title,
     };

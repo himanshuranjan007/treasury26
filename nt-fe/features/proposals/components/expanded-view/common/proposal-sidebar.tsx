@@ -29,6 +29,7 @@ import {
     isShortExpiryExchangeProposal,
     type UIProposalStatus,
 } from "@/features/proposals/utils/proposal-utils";
+import { extractProposalData } from "@/features/proposals/utils/proposal-extractors";
 import {
     extractReceiptProposalData,
     getProposalExecutedDate,
@@ -55,6 +56,13 @@ interface ProposalSidebarProps {
     policy: Policy;
     onVote: (vote: "Approve" | "Reject" | "Remove") => void;
     onDeposit: (tokenSymbol?: string, tokenNetwork?: string) => void;
+}
+
+function parseOptionalDate(value?: string | null) {
+    if (!value) return undefined;
+
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? undefined : date;
 }
 
 function TransactionCreated({
@@ -268,10 +276,17 @@ export function ProposalSidebar({
     const isUserVoter = !!proposal.votes[accountId ?? ""];
     const isPending = status === "Pending";
     const isExecuted = status === "Executed";
+    const isExchangeProposal = proposalType === "Exchange";
+    const isPaymentProposal = proposalType === "Payment Request";
+    const isConfidentialRequest = proposalType === "Confidential Request";
     const isBatchPaymentProposal = proposalType === "Batch Payment Request";
     const isConfidentialRequestProposal =
         proposalType === "Confidential Request";
     const isReceiptEligibleKind = isReceiptEligibleProposalKind(proposalType);
+    const receiptProposalData = extractReceiptProposalData(
+        proposal,
+        treasuryId,
+    );
 
     let newVotingDurationDays = 0;
     if (isVotingDurationChange) {
@@ -284,12 +299,32 @@ export function ProposalSidebar({
         }
     }
 
-    const receiptProposalData = extractReceiptProposalData(
-        proposal,
-        treasuryId,
-    );
-    const depositAddress = receiptProposalData?.depositAddress;
-    const isPaymentLikeProposal = receiptProposalData?.variant === "payment";
+    // Extract intents details for exchange/payment/confidential requests.
+    // Confidential metadata is backend-enriched and nested under mapped.data.
+    let depositAddress: string | undefined;
+    let isConfidentialPayment = false;
+    let confidentialProposalCreatedAt: Date | undefined;
+    let confidentialExecutedAt: Date | undefined;
+    if (isExchangeProposal || isPaymentProposal || isConfidentialRequest) {
+        try {
+            const { data } = extractProposalData(proposal, treasuryId);
+            if (isConfidentialRequest) {
+                const confidentialData = data as any;
+                confidentialProposalCreatedAt = parseOptionalDate(
+                    confidentialData?.proposalCreatedAt,
+                );
+                confidentialExecutedAt = parseOptionalDate(
+                    confidentialData?.executedAt,
+                );
+                const mapped = confidentialData?.mapped;
+                isConfidentialPayment = mapped?.type === "payment";
+                depositAddress = mapped?.data?.depositAddress;
+            } else {
+                depositAddress = (data as any)?.depositAddress;
+            }
+        } catch (e) {}
+    }
+    const isPaymentLikeProposal = isPaymentProposal || isConfidentialPayment;
 
     // Whether this proposal used the Intents protocol (has a deposit address)
     const hasDepositAddress = !!depositAddress;
@@ -322,6 +357,9 @@ export function ProposalSidebar({
     const isSwapSuccessReady = shouldRequireSwapSuccess
         ? isPublicTreasuryGuestViewer || swapStatus?.status === "SUCCESS"
         : true;
+    const isResolvedDateLoading =
+        isExecuted &&
+        (shouldUseSwapDate ? isLoadingSwapStatus : isLoadingTransaction);
     const isHidden = isConfidential && isGuestTreasury;
     // Receipt button visibility rules:
     // - Proposal must be executed and of a receipt-eligible kind.
@@ -349,17 +387,23 @@ export function ProposalSidebar({
         isShortExpiryExchangeProposal(proposal) &&
         nanosToMs(policy.proposal_period) > EXCHANGE_EXPIRY_MS;
 
-    const timestamp = shouldUseTransactionDate
-        ? (getProposalExecutedDate(swapStatus, transaction) ?? undefined)
-        : statusDateInfo.date;
-    const shouldShowResolvedDate = status !== "Pending" && status !== "Expired";
-    const resolvesDateFromTransaction = shouldUseTransactionDate;
-    const isResolvedDateLoading =
-        shouldShowResolvedDate && resolvesDateFromTransaction
-            ? shouldUseSwapDate
-                ? isLoadingSwapStatus
-                : isLoadingTransaction
-            : false;
+    let timestamp;
+    switch (status) {
+        case "Expired":
+        case "Pending":
+            timestamp = statusDateInfo.date;
+            break;
+
+        default:
+            timestamp =
+                confidentialExecutedAt ??
+                getProposalExecutedDate(swapStatus, transaction) ??
+                undefined;
+            break;
+    }
+    const createdAt =
+        confidentialProposalCreatedAt ??
+        new Date(nanosToMs(proposal.submission_time));
 
     const isLastApprovingVote = () => {
         const currentApprovals = Object.values(proposal.votes).filter(
@@ -423,7 +467,7 @@ export function ProposalSidebar({
             <div className="relative flex flex-col gap-4">
                 <TransactionCreated
                     proposer={proposal.proposer}
-                    date={new Date(nanosToMs(proposal.submission_time))}
+                    date={createdAt}
                 />
                 <VotingSection
                     proposal={proposal}

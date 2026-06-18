@@ -3,7 +3,7 @@
 //! When a confidential DAO approves a swap proposal, the DAO's `act_proposal`
 //! spawns a cross-contract call to `v1.signer`. That `v1.signer` execution
 //! outcome emits a single `sign: predecessor=AccountId("…"), request=…
-//! payload_v2: Some(Eddsa(Bytes("…")))` log, and Goldsky captures it because
+//! `sign:` log (legacy `payload_v2: Some(Eddsa(…))` or `payload: Eddsa(…)`), and Goldsky captures it because
 //! the log mentions a sputnik-dao account.
 //!
 //! The log itself tells us both *that* the proposal executed (v1.signer only
@@ -16,10 +16,13 @@ use bigdecimal::{BigDecimal, Zero};
 use near_api::NetworkConfig;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use serde_json::json;
+use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use super::counterparty::{convert_raw_to_decimal, ensure_ft_metadata};
+use crate::handlers::intents::confidential::bronze::store::link_intent_to_history_event;
+use crate::handlers::intents::confidential::gold::history_events::refresh_gold_metadata_for_intent;
+use crate::handlers::intents::confidential::types::{accounts_equal, bare_account};
 
 /// Legacy payload form: `predecessor=AccountId("…") … payload_v2: Some(Eddsa(Bytes("<hex>")))`.
 static V1_SIGNER_HEX: Lazy<Regex> = Lazy::new(|| {
@@ -29,7 +32,7 @@ static V1_SIGNER_HEX: Lazy<Regex> = Lazy::new(|| {
     .expect("v1.signer hex sign-log regex is valid")
 });
 
-/// Current payload form: `predecessor=AccountId("…") … payload_v2: Some(Eddsa(BoundedVec { inner: [u8, …] }))`.
+/// `payload_v2: Some(Eddsa(BoundedVec { inner: [u8, …] }))` form (2026-05).
 static V1_SIGNER_BYTES: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r#"predecessor=AccountId\("(?P<dao>[^"]+)"\).*payload_v2:\s*Some\(Eddsa\(BoundedVec\s*\{\s*inner:\s*\[(?P<bytes>[0-9,\s]+)\]"#,
@@ -37,11 +40,24 @@ static V1_SIGNER_BYTES: Lazy<Regex> = Lazy::new(|| {
     .expect("v1.signer bytes sign-log regex is valid")
 });
 
+/// `payload: Eddsa(BoundedVec { inner: [u8, …], witness: … })` form (2026-06+).
+static V1_SIGNER_PAYLOAD_BOUNDED: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"predecessor=AccountId\("(?P<dao>[^"]+)"\).*payload:\s*Eddsa\(BoundedVec\s*\{\s*inner:\s*\[(?P<bytes>[0-9,\s]+)\]"#,
+    )
+    .expect("v1.signer payload bounded sign-log regex is valid")
+});
+
 /// Extracted signal that a confidential sign call ran.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfidentialSignCall {
     pub dao_id: String,
     pub payload_hash: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubmittedIntentInfo {
+    pub recipient: Option<String>,
 }
 
 fn decode_bounded_vec_bytes(captured: &str) -> Option<String> {
@@ -58,8 +74,8 @@ fn decode_bounded_vec_bytes(captured: &str) -> Option<String> {
 }
 
 /// Scan a `v1.signer` outcome's logs for a `sign: predecessor=…` line and
-/// extract the DAO + payload hash if present. Supports both the legacy
-/// `Bytes("<hex>")` form and the current `BoundedVec { inner: [u8, …] }` form.
+/// extract the DAO + payload hash if present. Supports `Bytes("<hex>")`,
+/// `payload_v2: Some(Eddsa(BoundedVec …))`, and `payload: Eddsa(BoundedVec …)`.
 pub fn extract_sign_call_from_logs(logs: &str) -> Option<ConfidentialSignCall> {
     for raw_line in logs.split('\n').flat_map(|l| l.split("\\n")) {
         let line = raw_line.trim();
@@ -78,8 +94,84 @@ pub fn extract_sign_call_from_logs(logs: &str) -> Option<ConfidentialSignCall> {
                 payload_hash: decode_bounded_vec_bytes(cap.name("bytes")?.as_str())?,
             });
         }
+        if let Some(cap) = V1_SIGNER_PAYLOAD_BOUNDED.captures(line) {
+            return Some(ConfidentialSignCall {
+                dao_id: cap.name("dao")?.as_str().to_string(),
+                payload_hash: decode_bounded_vec_bytes(cap.name("bytes")?.as_str())?,
+            });
+        }
     }
     None
+}
+
+fn quote_recipient(quote_metadata: Option<&Value>) -> Option<String> {
+    let recipient = quote_metadata?
+        .get("quoteRequest")
+        .and_then(|q| q.get("recipient"))
+        .and_then(|v| v.as_str())?;
+    Some(bare_account(recipient))
+}
+
+pub async fn mark_confidential_intent_submitted(
+    app_pool: &PgPool,
+    dao_id: &str,
+    payload_hash: &str,
+    proposal_executed_at: chrono::DateTime<chrono::Utc>,
+    proposal_execution_block_height: Option<i64>,
+    proposal_execution_transaction_hash: Option<&str>,
+) -> Result<Option<SubmittedIntentInfo>, Box<dyn std::error::Error>> {
+    let row = sqlx::query_as::<_, (Option<Value>,)>(
+        r#"
+        SELECT quote_metadata
+        FROM confidential_intents
+        WHERE dao_id = $1
+          AND payload_hash = $2
+        "#,
+    )
+    .bind(dao_id)
+    .bind(payload_hash)
+    .fetch_optional(app_pool)
+    .await?;
+
+    let Some((quote_metadata,)) = row else {
+        return Ok(None);
+    };
+    let recipient = quote_recipient(quote_metadata.as_ref());
+
+    sqlx::query(
+        r#"
+        UPDATE confidential_intents
+        SET status = 'submitted',
+            proposal_executed_at = COALESCE(proposal_executed_at, $3),
+            proposal_execution_block_height = COALESCE(proposal_execution_block_height, $4),
+            proposal_execution_transaction_hash = COALESCE(proposal_execution_transaction_hash, $5),
+            updated_at = NOW()
+        WHERE dao_id = $1
+          AND payload_hash = $2
+        "#,
+    )
+    .bind(dao_id)
+    .bind(payload_hash)
+    .bind(proposal_executed_at)
+    .bind(proposal_execution_block_height)
+    .bind(proposal_execution_transaction_hash)
+    .execute(app_pool)
+    .await?;
+
+    if let Some(history_event_id) =
+        link_intent_to_history_event(app_pool, dao_id, payload_hash).await?
+    {
+        tracing::info!(
+            "linked submitted intent {}/{} to history_event_id={}",
+            dao_id,
+            payload_hash,
+            history_event_id
+        );
+    }
+
+    refresh_gold_metadata_for_intent(app_pool, dao_id, payload_hash).await?;
+
+    Ok(Some(SubmittedIntentInfo { recipient }))
 }
 
 /// Synthesize an outgoing `balance_change` row for a confidential DAO's swap
@@ -87,6 +179,8 @@ pub fn extract_sign_call_from_logs(logs: &str) -> Option<ConfidentialSignCall> {
 ///
 /// Returns `Ok(true)` if a row was written, `Ok(false)` if no matching intent
 /// record was found.
+// TODO(confidential-v2): remove this legacy public `balance_changes` writer
+// once `gold_confidential_history_events` backs list/chart/export reads.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_confidential_outgoing(
     app_pool: &PgPool,
@@ -112,8 +206,8 @@ pub async fn handle_confidential_outgoing(
     .await?;
 
     let Some(row) = row else {
-        log::warn!(
-            "[goldsky-enrichment] No confidential_intents row for dao={} payload_hash={}",
+        tracing::warn!(
+            "No confidential_intents row for dao={} payload_hash={}",
             dao_id,
             payload_hash
         );
@@ -121,8 +215,8 @@ pub async fn handle_confidential_outgoing(
     };
 
     let Some(quote_metadata) = row.quote_metadata else {
-        log::warn!(
-            "[goldsky-enrichment] confidential_intents for dao={} payload_hash={} has no quote_metadata",
+        tracing::warn!(
+            "confidential_intents for dao={} payload_hash={} has no quote_metadata",
             dao_id,
             payload_hash
         );
@@ -148,10 +242,11 @@ pub async fn handle_confidential_outgoing(
     let recipient = quote_metadata
         .get("quoteRequest")
         .and_then(|q| q.get("recipient"))
-        .and_then(|v| v.as_str());
+        .and_then(|v| v.as_str())
+        .map(bare_account);
     let (Some(origin_raw), Some(amount_in_raw)) = (origin_raw, amount_in_raw) else {
-        log::warn!(
-            "[goldsky-enrichment] quote_metadata for dao={} payload_hash={} missing originAsset or amountIn",
+        tracing::warn!(
+            "quote_metadata for dao={} payload_hash={} missing originAsset or amountIn",
             dao_id,
             payload_hash
         );
@@ -164,9 +259,9 @@ pub async fn handle_confidential_outgoing(
     //   - `recipient == dao_id` → self-swap. Counterparty = "intents.near", which
     //     mirrors the public intents pipeline so the UI renders public and
     //     confidential swaps identically.
-    let counterparty: &str = match recipient {
-        Some(r) if r != dao_id => r,
-        _ => "intents.near",
+    let counterparty: String = match recipient.as_deref() {
+        Some(r) if !accounts_equal(r, dao_id) => r.to_string(),
+        _ => "intents.near".to_string(),
     };
 
     let storage_token_id = format!("intents.near:{}", origin_raw);
@@ -242,8 +337,8 @@ pub async fn handle_confidential_outgoing(
     .fetch_one(app_pool)
     .await?;
 
-    log::info!(
-        "[goldsky-enrichment] Confidential outgoing leg for {}/{} amount=-{} (payload_hash={})",
+    tracing::info!(
+        "Confidential outgoing leg for {}/{} amount=-{} (payload_hash={})",
         dao_id,
         storage_token_id,
         amount_in,
@@ -262,8 +357,8 @@ pub async fn handle_confidential_outgoing(
             Some(raw) => match ensure_ft_metadata(app_pool, network, &received_storage_id).await {
                 Ok(decimals) => convert_raw_to_decimal(raw, decimals).ok(),
                 Err(e) => {
-                    log::warn!(
-                        "[goldsky-enrichment] ensure_ft_metadata({}) failed: {} — seeding detected_swaps without received_amount",
+                    tracing::warn!(
+                        "ensure_ft_metadata({}) failed: {} — seeding detected_swaps without received_amount",
                         received_storage_id,
                         e
                     );
@@ -311,8 +406,8 @@ pub async fn handle_confidential_outgoing(
         .execute(app_pool)
         .await
         {
-            log::warn!(
-                "[goldsky-enrichment] pre-seed detected_swaps failed for dao={} payload_hash={}: {}",
+            tracing::warn!(
+                "pre-seed detected_swaps failed for dao={} payload_hash={}: {}",
                 dao_id,
                 payload_hash,
                 e
@@ -354,6 +449,18 @@ mod tests {
         assert_eq!(
             got.payload_hash,
             "7ba2325847ed8a6c0dd512f9b1f0a987ca3d9c5055ce4d723e8c4858bfd72aab"
+        );
+    }
+
+    #[test]
+    fn parses_v1_signer_payload_bounded_vec_with_witness() {
+        // Real on-chain log captured 2026-06-04, block 201255187 (dedupingggg.sputnik-dao.near).
+        let log = r#"sign: predecessor=AccountId("dedupingggg.sputnik-dao.near"), request=SignRequestArgs { path: "dedupingggg.sputnik-dao.near", payload: Eddsa(BoundedVec { inner: [87, 249, 7, 178, 173, 216, 20, 193, 248, 189, 160, 114, 81, 65, 8, 58, 29, 224, 170, 146, 94, 100, 237, 122, 74, 216, 231, 25, 0, 252, 238, 243], witness: NonEmpty(()) }), domain_id: DomainId(1) }"#;
+        let got = extract_sign_call_from_logs(log).expect("should parse payload: form");
+        assert_eq!(got.dao_id, "dedupingggg.sputnik-dao.near");
+        assert_eq!(
+            got.payload_hash,
+            "57f907b2add814c1f8bda0725141083a1de0aa925e64ed7a4ad8e71900fceef3"
         );
     }
 }

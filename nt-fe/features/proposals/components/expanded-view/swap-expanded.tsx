@@ -63,16 +63,20 @@ function IntentsSwapExpanded({ data, isExecuted = false }: SwapExpandedProps) {
     const shouldLoadQuoteUsd =
         isExecuted &&
         !!data.depositAddress &&
-        !(data.quoteAmountInUsd && data.quoteAmountOutUsd);
+        (data.amountInUsd == null || data.amountOutUsd == null);
     const { data: quoteByDepositAddress } = useQuoteByDepositAddress(
         data.depositAddress || null,
         undefined,
         shouldLoadQuoteUsd,
     );
     const sourceAmountUsdRaw =
-        data.quoteAmountInUsd ?? quoteByDepositAddress?.amountInUsd;
+        data.amountInUsd != null
+            ? String(data.amountInUsd)
+            : quoteByDepositAddress?.amountInUsd;
     const destinationAmountUsdRaw =
-        data.quoteAmountOutUsd ?? quoteByDepositAddress?.amountOutUsd;
+        data.amountOutUsd != null
+            ? String(data.amountOutUsd)
+            : quoteByDepositAddress?.amountOutUsd;
     const sourceAmountUsdOverride =
         sourceAmountUsdRaw && !Number.isNaN(Number(sourceAmountUsdRaw))
             ? formatCurrency(Number(sourceAmountUsdRaw))
@@ -102,6 +106,8 @@ function IntentsSwapExpanded({ data, isExecuted = false }: SwapExpandedProps) {
             value: (
                 <Amount
                     amount={data.amountIn}
+                    showUSDValue={data.amountInUsd !== null}
+                    usdValue={data.amountInUsd ?? undefined}
                     showNetworkTooltip
                     tokenId={finalTokenInId}
                     usdTextOverride={sourceAmountUsdOverride}
@@ -113,6 +119,8 @@ function IntentsSwapExpanded({ data, isExecuted = false }: SwapExpandedProps) {
             value: (
                 <Amount
                     amountWithDecimals={data.amountOut}
+                    showUSDValue={data.amountOutUsd !== null}
+                    usdValue={data.amountOutUsd ?? undefined}
                     showNetworkTooltip
                     tokenId={finalTokenOutId}
                     usdTextOverride={destinationAmountUsdOverride}

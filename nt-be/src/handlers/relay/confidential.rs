@@ -8,6 +8,11 @@
 use crate::{
     AppState,
     constants::V1_SIGNER_CONTRACT_ID,
+    handlers::intents::confidential::{
+        bronze::ingest_worker::trigger_confidential_history_refresh,
+        gold::history_events::refresh_gold_metadata_for_intent, link_intent_to_history_event,
+        types::normalize_quote_metadata_accounts,
+    },
     handlers::relay::{effects::background, parse::ProposalKind},
     utils::cache::CacheKey,
 };
@@ -75,45 +80,64 @@ pub(crate) async fn fetch_mpc_public_key(
     Ok(result.data)
 }
 
+pub struct PendingIntentInput<'a> {
+    pub dao_id: &'a str,
+    pub payload_hash: &'a str,
+    pub intent_payload: &'a Value,
+    pub correlation_id: Option<&'a str>,
+    pub quote_metadata: Option<&'a Value>,
+    pub deposit_address: &'a str,
+    pub notes: Option<&'a str>,
+}
+
 /// Store a pending intent for later auto-submission.
 pub async fn store_pending_intent(
     pool: &PgPool,
-    dao_id: &str,
-    payload_hash: &str,
-    intent_payload: &Value,
-    correlation_id: Option<&str>,
-    quote_metadata: Option<&Value>,
-    notes: Option<&str>,
+    input: PendingIntentInput<'_>,
 ) -> Result<(), String> {
-    sqlx::query!(
+    let quote_metadata = input
+        .quote_metadata
+        .map(|v| normalize_quote_metadata_accounts(v.clone()));
+
+    sqlx::query(
         r#"
-        INSERT INTO confidential_intents (dao_id, payload_hash, intent_payload, correlation_id, quote_metadata, notes)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO confidential_intents (
+            dao_id,
+            payload_hash,
+            intent_payload,
+            correlation_id,
+            quote_metadata,
+            deposit_address,
+            notes
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT (dao_id, payload_hash) DO UPDATE SET
             intent_payload = EXCLUDED.intent_payload,
             correlation_id = EXCLUDED.correlation_id,
             quote_metadata = EXCLUDED.quote_metadata,
+            deposit_address = EXCLUDED.deposit_address,
             notes = EXCLUDED.notes,
             intent_type = 'shield',
             status = 'pending',
             submit_result = NULL,
             updated_at = NOW()
         "#,
-        dao_id,
-        payload_hash,
-        intent_payload,
-        correlation_id,
-        quote_metadata,
-        notes,
     )
+    .bind(input.dao_id)
+    .bind(input.payload_hash)
+    .bind(input.intent_payload)
+    .bind(input.correlation_id)
+    .bind(quote_metadata)
+    .bind(input.deposit_address)
+    .bind(input.notes)
     .execute(pool)
     .await
     .map_err(|e| format!("Failed to store pending intent: {}", e))?;
 
     log::info!(
         "Stored pending confidential intent for {} (hash={})",
-        dao_id,
-        payload_hash
+        input.dao_id,
+        input.payload_hash
     );
     Ok(())
 }
@@ -373,7 +397,7 @@ pub async fn try_auto_submit_intent(
                     );
                 }
 
-                let _ = sqlx::query!(
+                let update_result = sqlx::query!(
                     "UPDATE confidential_intents SET status = 'submitted', submit_result = $1, updated_at = NOW() WHERE dao_id = $2 AND payload_hash = $3",
                     &resp_body,
                     treasury_id,
@@ -381,6 +405,49 @@ pub async fn try_auto_submit_intent(
                 )
                 .execute(&state.db_pool)
                 .await;
+
+                if update_result.is_ok() {
+                    match link_intent_to_history_event(&state.db_pool, treasury_id, payload_hash)
+                        .await
+                    {
+                        Ok(Some(history_event_id)) => {
+                            log::info!(
+                                "Linked submitted confidential intent for {} (hash={}) to history_event_id={}",
+                                treasury_id,
+                                payload_hash,
+                                history_event_id
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            log::warn!(
+                                "Failed to link submitted confidential intent for {} (hash={}): {}",
+                                treasury_id,
+                                payload_hash,
+                                e
+                            );
+                        }
+                    }
+
+                    // Pull fresh Bronze for this DAO so the just-submitted intent's
+                    // 1Click history row is available immediately. Resets the
+                    // activity timestamp + next_poll_at so the scheduler stays
+                    // in the hot tier.
+                    trigger_confidential_history_refresh(state.as_ref(), treasury_id).await;
+
+                    // Must run after the refresh above so the Gold row exists.
+                    if let Err(e) =
+                        refresh_gold_metadata_for_intent(&state.db_pool, treasury_id, payload_hash)
+                            .await
+                    {
+                        log::warn!(
+                            "Failed to refresh confidential gold metadata for {} (hash={}): {}",
+                            treasury_id,
+                            payload_hash,
+                            e
+                        );
+                    }
+                }
             } else {
                 log::error!(
                     "1Click {} failed ({}) for {} (hash={}): {:?}",

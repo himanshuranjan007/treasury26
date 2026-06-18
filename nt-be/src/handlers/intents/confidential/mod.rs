@@ -6,8 +6,24 @@ use serde::{Deserialize, Serialize};
 use crate::AppState;
 
 pub mod balances;
+pub mod bronze;
 pub mod generate_intent;
+pub mod gold;
 pub mod prepare_auth;
+pub mod types;
+
+pub use bronze::store::link_intent_to_history_event;
+pub use bronze::{
+    HistoryEvent, HistoryPage, fetch_history, fetch_history_with_token,
+    spawn_confidential_history_worker, trigger_confidential_history_refresh,
+};
+pub use gold::{
+    get_confidential_balance_chart, mark_gold_dirty_for_history_event, mark_gold_dirty_tx,
+    project_confidential_gold_for_dao, refresh_gold_metadata_for_intent,
+    snapshot_confidential_dao_balances, spawn_confidential_gold_reconciliation_worker,
+    spawn_confidential_snapshot_worker,
+};
+pub use types::{ConfidentialTxType, HistoryStatus, accounts_equal, bare_account};
 
 /// Request body for authenticating a DAO with the 1Click confidential intents API.
 /// The signed data is a NEP-413 signature over an empty-intents auth payload,
@@ -105,7 +121,7 @@ pub async fn refresh_dao_jwt(
         .send()
         .await
         .map_err(|e| {
-            log::error!("Error refreshing JWT for DAO {}: {}", dao_id, e);
+            tracing::error!("Error refreshing JWT for DAO {}: {}", dao_id, e);
             (
                 StatusCode::BAD_GATEWAY,
                 format!("Failed to refresh JWT: {}", e),
@@ -115,7 +131,7 @@ pub async fn refresh_dao_jwt(
     let status = response.status();
     if !status.is_success() {
         let error_text = response.text().await.unwrap_or_default();
-        log::error!(
+        tracing::error!(
             "JWT refresh failed for DAO {} ({}): {}",
             dao_id,
             status,
@@ -159,13 +175,13 @@ pub async fn refresh_dao_jwt(
     .execute(&state.db_pool)
     .await
     .map_err(|e| {
-        log::error!("Failed to update JWT for DAO {}: {}", dao_id, e);
+        tracing::error!("Failed to update JWT for DAO {}: {}", dao_id, e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to update JWT tokens: {}", e),
         )
     })?;
 
-    log::info!("Refreshed confidential JWT for DAO {}", dao_id);
+    tracing::info!("Refreshed confidential JWT for DAO {}", dao_id);
     Ok(auth_response.access_token)
 }

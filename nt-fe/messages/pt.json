@@ -367,6 +367,7 @@
             "pending": "Pendente",
             "type": "Tipo",
             "date": "Data",
+            "request": "Solicitação",
             "from": "De",
             "to": "Para",
             "method": "Método",

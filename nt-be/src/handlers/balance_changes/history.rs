@@ -736,6 +736,24 @@ struct ExportRecord {
     receipt_id: String,
 }
 
+/// USD value of a balance change, preferring the value computed at quote time.
+///
+/// Confidential rows persist `amount_usd` (the exact quote-time USD) in
+/// `usd_value`, so we use it directly — it's accurate and needs no price-table
+/// lookup. Public rows have no stored value, so fall back to a spot
+/// `price × amount` estimate.
+fn resolve_value_usd(change: &EnrichedBalanceChange, price: Option<f64>) -> Option<f64> {
+    if let Some(stored) = change.usd_value.as_ref().and_then(|v| v.to_f64()) {
+        return Some(stored.abs());
+    }
+    change
+        .amount
+        .abs()
+        .to_f64()
+        .zip(price)
+        .map(|(amount, price)| amount * price)
+}
+
 /// Convert enriched balance changes to accounting-friendly export records
 fn transform_to_export_records(
     enriched_changes: Vec<EnrichedBalanceChange>,
@@ -751,11 +769,7 @@ fn transform_to_export_records(
 
             let price = metadata.price;
             let amount_val = change.amount.abs().to_f64().unwrap_or(0.0);
-            let value_usd = change
-                .amount
-                .abs()
-                .to_f64()
-                .and_then(|a| price.map(|p| a * p));
+            let value_usd = resolve_value_usd(&change, price);
 
             // Determine direction and addresses
             let is_incoming = change.amount.to_f64().map(|a| a > 0.0).unwrap_or(false);
@@ -1478,6 +1492,8 @@ pub struct RecentActivity {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposal_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub swap: Option<SwapInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action_kind: Option<String>,
@@ -1853,14 +1869,9 @@ pub async fn get_recent_activity(
                 .as_ref()
                 .expect("Metadata should always be present");
 
-            // Calculate USD value if price is available
-            let value_usd = token_metadata.price.and_then(|price| {
-                change
-                    .amount
-                    .abs()
-                    .to_f64()
-                    .map(|amount_f64| amount_f64 * price)
-            });
+            // Prefer the stored quote-time USD (confidential rows); fall back to a
+            // spot price estimate for public rows that have none.
+            let value_usd = resolve_value_usd(&change, token_metadata.price);
 
             // Filter by minimum USD value if specified
             if let Some(min_usd) = params.min_usd_value {
@@ -1873,27 +1884,54 @@ pub async fn get_recent_activity(
                 }
             }
 
-            // Check if this change has swap info (as fulfillment or deposit leg)
-            let swap = swap_map.get(&change.id).map(|(role, idx)| {
-                let s = &swap_records[*idx];
-                let sent_token_metadata = s
-                    .sent_token_id
-                    .as_ref()
-                    .map(|id| resolve_swap_metadata(id, &metadata_map));
-                let received_token_metadata =
-                    resolve_swap_metadata(&s.received_token_id, &metadata_map);
+            // Check if this change has swap info (as fulfillment or deposit leg).
+            // Public rows go through the detected_swaps join (`swap_map`).
+            // Confidential rows arrive with `change.swap` already populated by
+            // confidential_list (route-mod `SwapInfo`, no `swap_role`) — those
+            // are always the fulfillment side per the confidential exchange
+            // contract.
+            let swap = swap_map
+                .get(&change.id)
+                .map(|(role, idx)| {
+                    let s = &swap_records[*idx];
+                    let sent_token_metadata = s
+                        .sent_token_id
+                        .as_ref()
+                        .map(|id| resolve_swap_metadata(id, &metadata_map));
+                    let received_token_metadata =
+                        resolve_swap_metadata(&s.received_token_id, &metadata_map);
 
-                SwapInfo {
-                    sent_token_id: s.sent_token_id.clone(),
-                    sent_amount: s.sent_amount.clone(),
-                    sent_token_metadata,
-                    received_token_id: s.received_token_id.clone(),
-                    received_amount: s.received_amount.clone(),
-                    received_token_metadata,
-                    solver_transaction_hash: s.solver_transaction_hash.clone(),
-                    swap_role: role.to_string(),
-                }
-            });
+                    SwapInfo {
+                        sent_token_id: s.sent_token_id.clone(),
+                        sent_amount: s.sent_amount.clone(),
+                        sent_token_metadata,
+                        received_token_id: s.received_token_id.clone(),
+                        received_amount: s.received_amount.clone(),
+                        received_token_metadata,
+                        solver_transaction_hash: s.solver_transaction_hash.clone(),
+                        swap_role: role.to_string(),
+                    }
+                })
+                .or_else(|| {
+                    change.swap.as_ref().map(|s| {
+                        let sent_token_metadata = s
+                            .sent_token_id
+                            .as_ref()
+                            .map(|id| resolve_swap_metadata(id, &metadata_map));
+                        let received_token_metadata =
+                            resolve_swap_metadata(&s.received_token_id, &metadata_map);
+                        SwapInfo {
+                            sent_token_id: s.sent_token_id.clone(),
+                            sent_amount: s.sent_amount.clone(),
+                            sent_token_metadata,
+                            received_token_id: s.received_token_id.clone(),
+                            received_amount: s.received_amount.clone(),
+                            received_token_metadata,
+                            solver_transaction_hash: s.solver_transaction_hash.clone(),
+                            swap_role: "fulfillment".to_string(),
+                        }
+                    })
+                });
 
             Some(RecentActivity {
                 id: change.id,
@@ -1907,6 +1945,7 @@ pub async fn get_recent_activity(
                 transaction_hashes: change.transaction_hashes,
                 receipt_ids: change.receipt_id,
                 value_usd,
+                proposal_id: change.proposal_id,
                 swap,
                 action_kind: change.action_kind,
                 method_name: change.method_name,

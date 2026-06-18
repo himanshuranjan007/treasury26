@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
 
+use crate::handlers::intents::confidential::types::{ConfidentialQuoteMetadata, as_near_account};
 use crate::{AppState, auth::AuthUser};
 
 /// Request body for generating an intent to sign.
@@ -39,10 +40,15 @@ pub async fn generate_intent(
     auth_user: AuthUser,
     Json(request): Json<GenerateIntentRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let dao_id: AccountId = request
-        .signer_id
-        .strip_prefix("near:")
-        .unwrap_or(&request.signer_id)
+    // signerId is the intents identifier `near:dao.sputnik-dao.near`; resolve it to
+    // the bare NEAR account used for auth, JWT and on-chain calls.
+    let dao_id: AccountId = as_near_account(&request.signer_id)
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("signer_id '{}' is not a NEAR account", request.signer_id),
+            )
+        })?
         .parse()
         .map_err(|e: near_account_id::ParseAccountError| {
             (
@@ -52,12 +58,15 @@ pub async fn generate_intent(
         })?;
     auth_user.verify_can_add_proposal(&state, &dao_id).await?;
 
-    // Extract deposit_address from quote_metadata.quote.depositAddress
-    let deposit_address = request
-        .quote_metadata
-        .get("quote")
-        .and_then(|q| q.get("depositAddress"))
-        .and_then(|v| v.as_str())
+    let quote_meta =
+        ConfidentialQuoteMetadata::from_value(&request.quote_metadata).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "quote_metadata must be valid JSON with quote.depositAddress".to_string(),
+            )
+        })?;
+    let deposit_address = quote_meta
+        .deposit_address()
         .map(|s| s.to_string())
         .ok_or_else(|| {
             (
@@ -66,7 +75,7 @@ pub async fn generate_intent(
             )
         })?;
 
-    log::info!(
+    tracing::info!(
         "generate_intent called: type={}, signerId={}",
         request.r#type,
         request.signer_id
@@ -92,7 +101,7 @@ pub async fn generate_intent(
         req = req.header("x-api-key", api_key);
     }
     let response = req.json(&body).send().await.map_err(|e| {
-        log::error!("Error calling 1Click generate-intent API: {}", e);
+        tracing::error!("Error calling 1Click generate-intent API: {}", e);
         (
             StatusCode::BAD_GATEWAY,
             format!("Failed to generate intent: {}", e),
@@ -121,11 +130,7 @@ pub async fn generate_intent(
     }
 
     // Store the intent payload for auto-submission after DAO proposal approval.
-    // The signer_id format is "near:dao.sputnik-dao.near" or just "dao.sputnik-dao.near".
-    let dao_id = request
-        .signer_id
-        .strip_prefix("near:")
-        .unwrap_or(&request.signer_id);
+    let dao_id = dao_id.as_str();
     if let Some(payload) = response_body.get("intent").and_then(|i| i.get("payload")) {
         let correlation_id = response_body.get("correlationId").and_then(|v| v.as_str());
 
@@ -141,16 +146,19 @@ pub async fn generate_intent(
 
         if let Err(e) = crate::handlers::relay::confidential::store_pending_intent(
             &state.db_pool,
-            dao_id,
-            &payload_hash,
-            payload,
-            correlation_id,
-            Some(&request.quote_metadata),
-            request.notes.as_deref(),
+            crate::handlers::relay::confidential::PendingIntentInput {
+                dao_id,
+                payload_hash: &payload_hash,
+                intent_payload: payload,
+                correlation_id,
+                quote_metadata: Some(&request.quote_metadata),
+                deposit_address: &deposit_address,
+                notes: request.notes.as_deref(),
+            },
         )
         .await
         {
-            log::warn!("Failed to store pending intent for {}: {}", dao_id, e);
+            tracing::warn!("Failed to store pending intent for {}: {}", dao_id, e);
         }
 
         // Include the payload hash in the response so the frontend can use it
