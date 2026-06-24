@@ -153,9 +153,6 @@
         "warningSingleMember": "1/{memberCount}のしきい値では、メンバーの誰か一人でもトランザクションを実行できます。これはセキュリティを低下させます。",
         "infoBalanced": "{currentThreshold}/{memberCount}のしきい値は、セキュリティと運用上の柔軟性のバランスが取れています。"
     },
-    "intentsFee": {
-        "amountTooLowForFee": "{prefix}金額がネットワーク手数料({fee} {symbol})より低すぎます。少なくとも{addMore} {symbol}追加してください。"
-    },
     "metadata": {
         "treasuryTitle": "ダッシュボード | Trezu",
         "landingTitle": "Trezu | クロスチェーン・トレジャリー管理",
@@ -1102,6 +1099,7 @@
         },
         "recipients": "受取人",
         "insufficientTokens": "トークンが不足しています。リクエストを送信してから承認前に補充できます。",
+        "insufficientTokensForFee": "ネットワーク手数料({fee} {symbol})をカバーするトークンが不足しています。リクエストを送信してから承認前に補充できます。",
         "removeRecipient": "受取人を削除",
         "removeRecipientConfirm": "<strong>{recipient}</strong>への支払いを削除してもよろしいですか?この操作は取り消せません。",
         "remove": "削除",
@@ -1968,6 +1966,7 @@
     "tokenInput": {
         "max": "MAX",
         "insufficientTokens": "トークンが不足しています。リクエストを送信してから承認前に補充できます。",
+        "insufficientTokensForFee": "ネットワーク手数料({fee} {symbol})をカバーするトークンが不足しています。リクエストを送信してから承認前に補充できます。",
         "balance": "残高: {amount} {symbol}"
     },
     "createRequestButton": {
