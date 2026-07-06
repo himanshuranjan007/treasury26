@@ -120,7 +120,7 @@ jobs:
           gh release create "$BRANCH" \
             --title "v${VERSION}" \
             --target "$BRANCH" \
-            --notes '$CHANGELOGS'
+            --notes "$CHANGELOGS"
 
       - name: Assign linked issues to release milestone
         uses: actions/github-script@v7
