@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo, useCallback, ReactNode } from "react";
+import { useState, useMemo, useCallback, useEffect, useRef, ReactNode } from "react";
 import { Check } from "lucide-react";
 import { useTranslations } from "next-intl";
 import { Input } from "@/components/input";
@@ -72,6 +72,17 @@ export function SelectModal({
 }: SelectModalProps) {
     const t = useTranslations("selectModal");
     const [searchQuery, setSearchQuery] = useState("");
+    // Guard against rapid double-clicks: once a selection fires, ignore any
+    // subsequent clicks until the dialog has closed and re-opened.
+    const isSelectingRef = useRef(false);
+
+    // Reset the guard whenever the modal opens so it's ready for the next session.
+    useEffect(() => {
+        if (isOpen) {
+            isSelectingRef.current = false;
+        }
+    }, [isOpen]);
+
     const effectiveSearchPlaceholder = searchPlaceholder ?? t("searchByName");
 
     const filteredOptions = useMemo(() => {
@@ -109,6 +120,13 @@ export function SelectModal({
 
     const handleSelect = useCallback(
         (option: SelectOption) => {
+            // Prevent a rapid double-click from triggering the handler twice.
+            // The second click would otherwise call onSelect again while the
+            // modal's close animation is still running, causing a flicker where
+            // the modal briefly reopens.
+            if (isSelectingRef.current) return;
+            isSelectingRef.current = true;
+
             onSelect(option);
             if (!multiSelect) {
                 setSearchQuery("");
