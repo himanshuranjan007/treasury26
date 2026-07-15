@@ -120,13 +120,12 @@ export function SelectModal({
 
     const handleSelect = useCallback(
         (option: SelectOption) => {
-            // Prevent a rapid double-click from triggering the handler twice.
-            // The second click would otherwise call onSelect again while the
-            // modal's close animation is still running, causing a flicker where
-            // the modal briefly reopens.
-            if (isSelectingRef.current) return;
-            isSelectingRef.current = true;
-
+            // Prevent a rapid double-click from triggering the handler twice (single-select only).
+            // For multi-select we must allow multiple item clicks while the modal remains open.
+            if (!multiSelect) {
+                if (isSelectingRef.current) return;
+                isSelectingRef.current = true;
+            }
             onSelect(option);
             if (!multiSelect) {
                 setSearchQuery("");
