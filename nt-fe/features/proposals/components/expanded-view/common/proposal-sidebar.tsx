@@ -34,8 +34,8 @@ import {
 } from "@/features/proposals/utils/proposal-utils";
 import {
     extractReceiptProposalData,
-    getProposalExecutedDate,
     isReceiptEligibleProposalKind,
+    resolveExecutionTimestamp,
 } from "@/features/proposals/utils/receipt-utils";
 import {
     useProposals,
@@ -364,14 +364,16 @@ export function ProposalSidebar({
 
     // Fetch transaction data for non-intents proposals, or for statuses
     // whose resolved date/link should come from the chain transaction.
-    const { data: transaction, isLoading: isLoadingTransaction } =
-        useProposalTransaction(
-            treasuryId,
-            proposal,
-            policy,
-            shouldUseTransactionDate &&
-                (!hasDepositAddress || !shouldUseSwapDate),
-        );
+    const {
+        data: transaction,
+        isLoading: isLoadingTransaction,
+        isAwaitingTransaction,
+    } = useProposalTransaction(
+        treasuryId,
+        proposal,
+        policy,
+        shouldUseTransactionDate && (!hasDepositAddress || !shouldUseSwapDate),
+    );
 
     // Fetch swap status for executed intents proposals (exchange or payment).
     const shouldFetchSwapStatus = isExecuted && hasDepositAddress;
@@ -391,9 +393,17 @@ export function ProposalSidebar({
     const isSwapSuccessReady = shouldRequireSwapSuccess
         ? isPublicTreasuryGuestViewer || swapStatus?.status === "SUCCESS"
         : true;
-    const isResolvedDateLoading =
-        isExecuted &&
-        (shouldUseSwapDate ? isLoadingSwapStatus : isLoadingTransaction);
+    const { executedDate, isDateLoading: resolvedDateLoading } =
+        resolveExecutionTimestamp({
+            swapStatus,
+            transaction,
+            shouldUseSwapDate,
+            isLoadingSwapStatus,
+            isLoadingTransaction,
+            isAwaitingTransaction,
+            fallbackDate: confidentialExecutedAt ?? publicExecutedAt,
+        });
+    const isResolvedDateLoading = isExecuted && resolvedDateLoading;
     const isHidden = isConfidential && isGuestTreasury;
 
     // Confidential exchange (a confidential request that is not a payment).
@@ -450,11 +460,7 @@ export function ProposalSidebar({
             break;
 
         default:
-            timestamp =
-                confidentialExecutedAt ??
-                publicExecutedAt ??
-                getProposalExecutedDate(swapStatus, transaction) ??
-                undefined;
+            timestamp = executedDate ?? undefined;
             break;
     }
     const createdAt =

@@ -133,6 +133,49 @@ export function getProposalExecutedDate(
     return null;
 }
 
+/**
+ * Shared execution-timestamp resolution for table / sidebar / receipt.
+ * Keeps swap-vs-NearBlocks loading rules in one place so call sites can't drift.
+ */
+export function resolveExecutionTimestamp({
+    swapStatus,
+    transaction,
+    shouldUseSwapDate,
+    isLoadingSwapStatus,
+    isLoadingTransaction,
+    isAwaitingTransaction,
+    fallbackDate,
+}: {
+    swapStatus: SwapStatusResponse | null | undefined;
+    transaction: { timestamp: number } | null | undefined;
+    shouldUseSwapDate: boolean;
+    isLoadingSwapStatus: boolean;
+    isLoadingTransaction: boolean;
+    isAwaitingTransaction: boolean;
+    /** e.g. confidential metadata executedAt */
+    fallbackDate?: Date | null;
+}): { executedDate: Date | null; isDateLoading: boolean } {
+    const executedDate =
+        fallbackDate ??
+        getProposalExecutedDate(swapStatus, transaction) ??
+        null;
+
+    if (executedDate) {
+        return { executedDate, isDateLoading: false };
+    }
+
+    const isAwaitingSwapDate =
+        shouldUseSwapDate &&
+        !swapStatus?.updatedAt &&
+        !isTerminalSwapStatus(swapStatus?.status);
+
+    const isDateLoading =
+        (shouldUseSwapDate ? isLoadingSwapStatus : isLoadingTransaction) ||
+        (shouldUseSwapDate ? isAwaitingSwapDate : isAwaitingTransaction);
+
+    return { executedDate, isDateLoading };
+}
+
 function toPaymentReceiptData(data: PaymentRequestData): ReceiptProposalData {
     return {
         variant: "payment",

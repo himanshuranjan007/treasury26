@@ -34,8 +34,8 @@ import { extractProposalData } from "@/features/proposals/utils/proposal-extract
 import {
     extractConfidentialBulkReceiptData,
     extractReceiptProposalData,
-    getProposalExecutedDate,
     isReceiptEligibleProposalKind,
+    resolveExecutionTimestamp,
 } from "@/features/proposals/utils/receipt-utils";
 import { NetworkIconDisplay } from "@/components/token-display";
 import {
@@ -746,13 +746,16 @@ export default function RequestReceiptPage({
     const isExecutableReceipt = status === "Executed";
     const shouldUseSwapExecutionDate = isExecutableReceipt && !!depositAddress;
 
-    const { data: transaction, isLoading: isLoadingTransaction } =
-        useProposalTransaction(
-            treasuryId,
-            proposal,
-            policy,
-            !isHidden && !!proposal && !!policy,
-        );
+    const {
+        data: transaction,
+        isLoading: isLoadingTransaction,
+        isAwaitingTransaction,
+    } = useProposalTransaction(
+        treasuryId,
+        proposal,
+        policy,
+        !isHidden && !!proposal && !!policy,
+    );
     const { data: swapStatus, isLoading: isLoadingSwapStatus } = useSwapStatus(
         depositAddress,
         undefined,
@@ -767,7 +770,17 @@ export default function RequestReceiptPage({
         !shouldUseSwapExecutionDate ||
         (!isConfidential && isGuestTreasury) ||
         swapStatus?.status === "SUCCESS";
-    const transactionDate = getProposalExecutedDate(swapStatus, transaction);
+    const {
+        executedDate: transactionDate,
+        isDateLoading: resolvedTransactionDateLoading,
+    } = resolveExecutionTimestamp({
+        swapStatus,
+        transaction,
+        shouldUseSwapDate: shouldUseSwapExecutionDate,
+        isLoadingSwapStatus,
+        isLoadingTransaction,
+        isAwaitingTransaction,
+    });
     const isExchangeProposal = receiptProposalVariant === "exchange";
     const hasDepositAddress = !!depositAddress;
     const isNearComDestination = isNearComPaymentRoute({
@@ -945,9 +958,7 @@ export default function RequestReceiptPage({
     const isTransactionDateLoading =
         isExecutableReceipt &&
         isSingleReceiptProposal &&
-        (shouldUseSwapExecutionDate
-            ? isLoadingSwapStatus
-            : isLoadingTransaction);
+        resolvedTransactionDateLoading;
     const isRateLoading = hasDepositAddress
         ? isSingleReceiptProposal &&
           !isConfidentialRequestProposal &&
